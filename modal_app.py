@@ -23,6 +23,8 @@ class GenerateRequest(BaseModel):
     upscaler_strength: float = 1.0
     seed: int = -1
     sampler: str = "Euler"
+    match_pattern_colors: bool = True
+    convert_to_bw: bool = True
 
 # ---------------------------------------------------------------------------
 # Modal App & Image
@@ -41,6 +43,7 @@ image = (
         "xformers==0.0.23.post1",
         "safetensors",
         "huggingface-hub==0.25.2",
+        "scikit-image",
         "Pillow",
         "gradio~=4.44",
         "fastapi[standard]",
@@ -152,13 +155,26 @@ def _run_inference(main_pipe, image_pipe, SAMPLER_MAP, control_image, prompt,
                    negative_prompt="low quality", guidance_scale=7.5,
                    controlnet_conditioning_scale=0.8, control_guidance_start=0.0,
                    control_guidance_end=1.0, upscaler_strength=1.0, seed=-1,
-                   sampler="Euler"):
+                   sampler="Euler", match_pattern_colors=True,
+                   convert_to_bw=True):
     """Core two-pass illusion diffusion pipeline."""
     import random
     import time
     import torch
+    import numpy as np
+    from skimage.exposure import match_histograms
+    from PIL import Image
 
     start = time.time()
+    
+    # ----------------------------------------------------
+    # Convert input to high-contrast Black&White if enabled
+    # ----------------------------------------------------
+    if convert_to_bw:
+        print("🔲  Converting pattern to Black & White...")
+        # L mode = grayscale. Converting back to RGB because the pipeline expects 3 channels.
+        control_image = control_image.convert("L").convert("RGB")
+
     control_image_small = _center_crop_resize(control_image, (512, 512))
     control_image_large = _center_crop_resize(control_image, (1024, 1024))
 
@@ -201,9 +217,19 @@ def _run_inference(main_pipe, image_pipe, SAMPLER_MAP, control_image, prompt,
         controlnet_conditioning_scale=float(controlnet_conditioning_scale),
     )
 
+    result = out_image["images"][0]
+
+    if match_pattern_colors:
+        print("🎨  Applying color matching from pattern image...")
+        # Match colors to the original control_image
+        ref_image = np.array(control_image)
+        gen_image = np.array(result)
+        matched = match_histograms(gen_image, ref_image, channel_axis=-1)
+        result = Image.fromarray(matched.astype(np.uint8))
+
     elapsed = time.time() - start
     print(f"⏱️  Generated in {elapsed:.1f}s (seed={my_seed})")
-    return out_image["images"][0], my_seed
+    return result, my_seed
 
 
 # ---------------------------------------------------------------------------
@@ -238,6 +264,8 @@ class Inference:
         upscaler_strength: float = 1.0,
         seed: int = -1,
         sampler: str = "Euler",
+        match_pattern_colors: bool = True,
+        convert_to_bw: bool = True,
     ) -> bytes:
         """Run the two-pass illusion diffusion pipeline. Returns PNG bytes."""
         from PIL import Image
@@ -248,6 +276,7 @@ class Inference:
             control_image, prompt, negative_prompt, guidance_scale,
             controlnet_conditioning_scale, control_guidance_start,
             control_guidance_end, upscaler_strength, seed, sampler,
+            match_pattern_colors, convert_to_bw
         )
         buf = io.BytesIO()
         result.save(buf, format="PNG")
@@ -277,6 +306,8 @@ class Inference:
             item.upscaler_strength,
             item.seed,
             item.sampler,
+            item.match_pattern_colors,
+            item.convert_to_bw,
         )
 
         buf = io.BytesIO()
@@ -308,6 +339,7 @@ def web_ui():
     _gcu._json_schema_to_python_type = _safe_schema_fn
 
     import gradio as gr
+    gr.set_static_paths(paths=["/assets"])
 
     print("🔄  Loading models for Gradio UI...")
     main_pipe, image_pipe, SAMPLER_MAP = _load_pipelines()
@@ -317,6 +349,7 @@ def web_ui():
         control_image, prompt, negative_prompt, guidance_scale,
         controlnet_conditioning_scale, control_guidance_start,
         control_guidance_end, upscaler_strength, seed, sampler,
+        match_pattern_colors, convert_to_bw
     ):
         if control_image is None:
             raise gr.Error("Please select or upload an Input Illusion")
@@ -328,14 +361,11 @@ def web_ui():
             control_image, prompt, negative_prompt, guidance_scale,
             controlnet_conditioning_scale, control_guidance_start,
             control_guidance_end, upscaler_strength, seed, sampler,
+            match_pattern_colors, convert_to_bw
         )
         return result, my_seed
 
-    with gr.Blocks(title="IllusionDiffusion 🌀", theme=gr.themes.Soft()) as demo:
-        # Workaround for Gradio 4.44+ 'max_file_size' AttributeError during upload
-        demo.max_file_size = "100mb"
-        if not hasattr(demo, "max_file_size"):
-            setattr(demo, "max_file_size", "100mb")
+    with gr.Blocks(title="IllusionDiffusion 🌀", theme=gr.themes.Soft(), max_file_size="100mb") as demo:
         gr.Markdown(
             """
             <div style="text-align: center;">
@@ -374,6 +404,8 @@ def web_ui():
                     control_start = gr.Slider(0.0, 1.0, step=0.1, value=0, label="Start of ControlNet")
                     control_end = gr.Slider(0.0, 1.0, step=0.1, value=1, label="End of ControlNet")
                     strength = gr.Slider(0.0, 1.0, step=0.1, value=1, label="Upscaler Strength")
+                    convert_to_bw = gr.Checkbox(value=True, label="Convert Template to B&W", info="Best illusions happen when the template is high-contrast black & white.")
+                    match_pattern_colors = gr.Checkbox(value=True, label="Match Pattern Colors", info="Forces the output to inherit colors from the pattern image.")
                     seed = gr.Slider(-1, 9999999999, step=1, value=-1, label="Seed", info="-1 = random")
                 run_btn = gr.Button("🎨 Generate", variant="primary")
             with gr.Column():
@@ -383,13 +415,14 @@ def web_ui():
         inputs = [
             control_image, prompt, negative_prompt, guidance_scale,
             controlnet_conditioning_scale, control_start, control_end,
-            strength, seed, sampler,
+            strength, seed, sampler, match_pattern_colors, convert_to_bw
         ]
         outputs = [result_image, used_seed]
 
         run_btn.click(inference, inputs=inputs, outputs=outputs)
         prompt.submit(inference, inputs=inputs, outputs=outputs)
 
+    demo.queue(max_size=5)
     return demo.app
 
 
